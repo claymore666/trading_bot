@@ -6,3 +6,6 @@
 
 # Ignore compiled Python files
 *.pyc
+*.csv
+*.json
+*.log

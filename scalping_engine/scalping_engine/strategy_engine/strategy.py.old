@@ -1,0 +1,741 @@
+import pandas as pd
+import numpy as np
+from typing import Dict, List, Any, Optional, Tuple, Union, Callable
+from loguru import logger
+from datetime import datetime
+from abc import ABC, abstractmethod
+
+# Annahme: Diese Funktion existiert in einem anderen Modul
+from scalping_engine.data_manager.processor import process_market_data
+
+
+class StrategyBase(ABC):
+    """
+    Basisklasse für alle Handelsstrategien.
+    Definiert die gemeinsame Schnittstelle und Funktionalität.
+    """
+    
+    def __init__(
+        self,
+        name: str,
+        description: str = "",
+        parameters: Dict[str, Any] = None,
+        risk_per_trade: float = 1.0
+    ):
+        """
+        Initialisiert die Basisstrategie.
+        
+        Args:
+            name: Name der Strategie
+            description: Beschreibung der Strategie
+            parameters: Parameter der Strategie
+            risk_per_trade: Risiko pro Trade in Prozent des Kapitals
+        """
+        self.name = name
+        self.description = description
+        self.parameters = parameters or {}
+        self.risk_per_trade = risk_per_trade
+        
+        # Interne Zustandsvariablen
+        self.is_initialized = False
+        self._data = None
+        
+    def initialize(self, data: pd.DataFrame) -> None:
+        """
+        Initialisiert die Strategie mit den Marktdaten.
+        
+        Args:
+            data: OHLCV-Daten als DataFrame
+        """
+        if data.empty:
+            logger.error("Leere Daten für Strategie-Initialisierung")
+            self.is_initialized = False
+            return
+        
+        # Marktdaten vorverarbeiten und Features hinzufügen
+        self._data = process_market_data(
+            df=data,
+            clean=True,
+            add_features=True,
+            add_volume=True,
+            detect_market_gaps=True
+        )
+        
+        self.is_initialized = True
+        logger.info(f"Strategie {self.name} initialisiert mit {len(self._data)} Datenpunkten")
+    
+    @abstractmethod
+    def generate_signals(self) -> pd.DataFrame:
+        """
+        Generiert Handelssignale basierend auf den initialisierten Daten.
+        Muss von den abgeleiteten Klassen implementiert werden.
+        
+        Returns:
+            pd.DataFrame: DataFrame mit Signalen (1 für Long, -1 für Short, 0 für neutral)
+        """
+        pass
+    
+    def calculate_position_size(self, price: float, stop_loss: float, capital: float) -> float:
+        """
+        Berechnet die Positionsgröße basierend auf dem Risiko pro Trade.
+        
+        Args:
+            price: Aktueller Preis
+            stop_loss: Stop-Loss-Preis
+            capital: Verfügbares Kapital
+            
+        Returns:
+            float: Positionsgröße in Einheiten
+        """
+        # Minimaler Stop-Loss für numerische Stabilität
+        min_price_diff = price * 0.0001  # 0.01% des Preises
+        
+        # Absolute Differenz zwischen Preis und Stop-Loss berechnen
+        price_diff = abs(price - stop_loss)
+        price_diff = max(price_diff, min_price_diff)  # Nulldivision verhindern
+        
+        # Risikobetrag berechnen
+        risk_amount = capital * (self.risk_per_trade / 100)
+        
+        # Positionsgröße berechnen
+        position_size = risk_amount / price_diff
+        
+        return position_size
+    
+    def calculate_stop_loss(
+        self, 
+        price: float, 
+        direction: int, 
+        atr_multiplier: float = 2.0, 
+        custom_atr: Optional[float] = None
+    ) -> float:
+        """
+        Berechnet den Stop-Loss-Preis basierend auf ATR.
+        
+        Args:
+            price: Aktueller Preis
+            direction: Handelsrichtung (1 für Long, -1 für Short)
+            atr_multiplier: Multiplikator für den ATR-Wert
+            custom_atr: Optionaler benutzerdefinierter ATR-Wert
+            
+        Returns:
+            float: Stop-Loss-Preis
+        """
+        if not self.is_initialized or self._data is None or self._data.empty:
+            logger.error("Strategie nicht initialisiert oder keine Daten vorhanden")
+            return price * 0.95 if direction > 0 else price * 1.05
+        
+        # ATR verwenden, falls in den Daten vorhanden
+        if custom_atr is not None:
+            atr = custom_atr
+        elif 'true_range' in self._data.columns:
+            atr = self._data['true_range'].iloc[-1]
+        else:
+            # Fallback: Nimm 2% des Preises als "ATR"
+            atr = price * 0.02
+            logger.warning("Kein ATR in Daten gefunden, verwende 2% des Preises als Fallback")
+        
+        # Stop-Loss-Preis berechnen
+        stop_loss = price - (direction * atr_multiplier * atr)
+        
+        return stop_loss
+    
+    def calculate_take_profit(
+        self, 
+        price: float, 
+        direction: int, 
+        risk_reward_ratio: float = 2.0,
+        stop_loss: Optional[float] = None
+    ) -> float:
+        """
+        Berechnet den Take-Profit-Preis basierend auf dem Risiko-Rendite-Verhältnis.
+        
+        Args:
+            price: Aktueller Preis
+            direction: Handelsrichtung (1 für Long, -1 für Short)
+            risk_reward_ratio: Gewünschtes Risiko-Rendite-Verhältnis
+            stop_loss: Optionaler benutzerdefinierter Stop-Loss-Preis
+            
+        Returns:
+            float: Take-Profit-Preis
+        """
+        if stop_loss is None:
+            stop_loss = self.calculate_stop_loss(price, direction)
+        
+        # Risiko berechnen (Abstand vom Einstieg zum Stop-Loss)
+        risk = abs(price - stop_loss)
+        
+        # Take-Profit als Vielfaches des Risikos
+        take_profit = price + (direction * risk * risk_reward_ratio)
+        
+        return take_profit
+    
+    def backtest(
+        self,
+        initial_capital: float = 10000.0,
+        commission: float = 0.001,  # 0.1% pro Trade
+        risk_reward_ratio: float = 2.0,
+        atr_multiplier: float = 2.0
+    ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+        """
+        Führt einen Backtest der Strategie durch.
+        
+        Args:
+            initial_capital: Anfangskapital
+            commission: Kommission pro Trade
+            risk_reward_ratio: Gewünschtes Risiko-Rendite-Verhältnis
+            atr_multiplier: Multiplikator für ATR bei der Stop-Loss-Berechnung
+            
+        Returns:
+            Tuple[pd.DataFrame, Dict[str, Any]]: DataFrame mit Backtest-Ergebnissen und Metriken
+        """
+        if not self.is_initialized or self._data is None or self._data.empty:
+            logger.error("Strategie nicht initialisiert oder keine Daten vorhanden")
+            return pd.DataFrame(), {}
+        
+        # Signale generieren
+        signals = self.generate_signals()
+        
+        if signals.empty:
+            logger.error("Keine Handelssignale generiert")
+            return pd.DataFrame(), {}
+        
+        # DataFrame für Backtest-Ergebnisse vorbereiten
+        results = signals.copy()
+        
+        # Spalten für Backtest-Ergebnisse hinzufügen
+        results['position'] = 0.0
+        results['capital'] = initial_capital
+        results['equity'] = initial_capital
+        results['returns'] = 0.0
+        results['drawdown'] = 0.0
+        results['drawdown_pct'] = 0.0
+        
+        # Aktuelle Position und Kapital
+        position = 0.0
+        capital = initial_capital
+        entry_price = 0.0
+        stop_loss = 0.0
+        take_profit = 0.0
+        peak_equity = initial_capital
+        
+        # Trades-Liste für detaillierte Analyse
+        trades = []
+        
+        # Backtest durchführen
+        for i, (idx, row) in enumerate(results.iterrows()):
+            # Aktueller Preis
+            price = row['close']
+            
+            # ATR für Stop-Loss-Berechnung
+            atr = row['true_range'] if 'true_range' in row else price * 0.02
+            
+            # Signal für diesen Zeitpunkt
+            signal = row['signal']
+            
+            # Wenn eine aktive Position besteht, prüfen wir, ob Stop-Loss oder Take-Profit erreicht wurde
+            if position != 0:
+                # Für Long-Positionen
+                if position > 0:
+                    # Stop-Loss erreicht?
+                    if row['low'] <= stop_loss:
+                        # Trade schließen zum Stop-Loss-Preis
+                        trade_result = (stop_loss / entry_price - 1) * 100
+                        trade_profit = position * entry_price * (stop_loss / entry_price - 1)
+                        capital += position * stop_loss * (1 - commission) - position * entry_price * (1 + commission)
+                        
+                        trades.append({
+                            'entry_time': entry_time,
+                            'exit_time': idx,
+                            'direction': 'long',
+                            'entry_price': entry_price,
+                            'exit_price': stop_loss,
+                            'position_size': position,
+                            'profit_loss': trade_profit,
+                            'profit_loss_pct': trade_result,
+                            'exit_reason': 'stop_loss'
+                        })
+                        
+                        position = 0
+                        logger.debug(f"Long-Position geschlossen bei Stop-Loss {stop_loss:.2f}, P/L: {trade_result:.2f}%")
+                    
+                    # Take-Profit erreicht?
+                    elif row['high'] >= take_profit:
+                        # Trade schließen zum Take-Profit-Preis
+                        trade_result = (take_profit / entry_price - 1) * 100
+                        trade_profit = position * entry_price * (take_profit / entry_price - 1)
+                        capital += position * take_profit * (1 - commission) - position * entry_price * (1 + commission)
+                        
+                        trades.append({
+                            'entry_time': entry_time,
+                            'exit_time': idx,
+                            'direction': 'long',
+                            'entry_price': entry_price,
+                            'exit_price': take_profit,
+                            'position_size': position,
+                            'profit_loss': trade_profit,
+                            'profit_loss_pct': trade_result,
+                            'exit_reason': 'take_profit'
+                        })
+                        
+                        position = 0
+                        logger.debug(f"Long-Position geschlossen bei Take-Profit {take_profit:.2f}, P/L: {trade_result:.2f}%")
+                
+                # Für Short-Positionen
+                elif position < 0:
+                    # Stop-Loss erreicht?
+                    if row['high'] >= stop_loss:
+                        # Trade schließen zum Stop-Loss-Preis
+                        trade_result = (entry_price / stop_loss - 1) * 100
+                        trade_profit = -position * entry_price * (entry_price / stop_loss - 1)
+                        capital += -position * entry_price * (1 - commission) - (-position) * stop_loss * (1 + commission)
+                        
+                        trades.append({
+                            'entry_time': entry_time,
+                            'exit_time': idx,
+                            'direction': 'short',
+                            'entry_price': entry_price,
+                            'exit_price': stop_loss,
+                            'position_size': -position,
+                            'profit_loss': trade_profit,
+                            'profit_loss_pct': trade_result,
+                            'exit_reason': 'stop_loss'
+                        })
+                        
+                        position = 0
+                        logger.debug(f"Short-Position geschlossen bei Stop-Loss {stop_loss:.2f}, P/L: {trade_result:.2f}%")
+                    
+                    # Take-Profit erreicht?
+                    elif row['low'] <= take_profit:
+                        # Trade schließen zum Take-Profit-Preis
+                        trade_result = (entry_price / take_profit - 1) * 100
+                        trade_profit = -position * entry_price * (entry_price / take_profit - 1)
+                        capital += -position * entry_price * (1 - commission) - (-position) * take_profit * (1 + commission)
+                        
+                        trades.append({
+                            'entry_time': entry_time,
+                            'exit_time': idx,
+                            'direction': 'short',
+                            'entry_price': entry_price,
+                            'exit_price': take_profit,
+                            'position_size': -position,
+                            'profit_loss': trade_profit,
+                            'profit_loss_pct': trade_result,
+                            'exit_reason': 'take_profit'
+                        })
+                        
+                        position = 0
+                        logger.debug(f"Short-Position geschlossen bei Take-Profit {take_profit:.2f}, P/L: {trade_result:.2f}%")
+            
+            # Wenn keine Position besteht und ein Signal vorliegt, eröffnen wir eine neue Position
+            if position == 0 and signal != 0:
+                # Long-Position eröffnen
+                if signal > 0:
+                    # Stop-Loss berechnen
+                    stop_loss = self.calculate_stop_loss(price, 1, atr_multiplier, atr)
+                    
+                    # Take-Profit berechnen
+                    take_profit = self.calculate_take_profit(price, 1, risk_reward_ratio, stop_loss)
+                    
+                    # Positionsgröße berechnen
+                    position_size = self.calculate_position_size(price, stop_loss, capital)
+                    
+                    # Position eröffnen
+                    position = position_size
+                    entry_price = price
+                    entry_time = idx
+                    
+                    logger.debug(f"Long-Position eröffnet bei {price:.2f}, Stop-Loss: {stop_loss:.2f}, Take-Profit: {take_profit:.2f}")
+                
+                # Short-Position eröffnen
+                elif signal < 0:
+                    # Stop-Loss berechnen
+                    stop_loss = self.calculate_stop_loss(price, -1, atr_multiplier, atr)
+                    
+                    # Take-Profit berechnen
+                    take_profit = self.calculate_take_profit(price, -1, risk_reward_ratio, stop_loss)
+                    
+                    # Positionsgröße berechnen
+                    position_size = self.calculate_position_size(price, stop_loss, capital)
+                    
+                    # Position eröffnen
+                    position = -position_size
+                    entry_price = price
+                    entry_time = idx
+                    
+                    logger.debug(f"Short-Position eröffnet bei {price:.2f}, Stop-Loss: {stop_loss:.2f}, Take-Profit: {take_profit:.2f}")
+            
+            # Aktuelle Position und Equity aktualisieren
+            results.loc[idx, 'position'] = position
+            
+            # Wenn eine Position besteht, aktualisieren wir die Equity basierend auf dem aktuellen Preis
+            if position != 0:
+                if position > 0:  # Long-Position
+                    results.loc[idx, 'equity'] = capital + position * (price * (1 - commission) - entry_price * (1 + commission))
+                else:  # Short-Position
+                    results.loc[idx, 'equity'] = capital + (-position) * (entry_price * (1 - commission) - price * (1 + commission))
+            else:
+                results.loc[idx, 'equity'] = capital
+            
+            # Kapital aktualisieren
+            results.loc[idx, 'capital'] = capital
+            
+            # Maximum-Equity aktualisieren
+            peak_equity = max(peak_equity, results.loc[idx, 'equity'])
+            
+            # Drawdown berechnen
+            results.loc[idx, 'drawdown'] = peak_equity - results.loc[idx, 'equity']
+            results.loc[idx, 'drawdown_pct'] = (results.loc[idx, 'drawdown'] / peak_equity) * 100
+        
+        # Letzte offene Position schließen
+        if position != 0:
+            last_price = results.iloc[-1]['close']
+            
+            if position > 0:  # Long-Position
+                trade_result = (last_price / entry_price - 1) * 100
+                trade_profit = position * entry_price * (last_price / entry_price - 1)
+                capital += position * last_price * (1 - commission) - position * entry_price * (1 + commission)
+                
+                trades.append({
+                    'entry_time': entry_time,
+                    'exit_time': results.index[-1],
+                    'direction': 'long',
+                    'entry_price': entry_price,
+                    'exit_price': last_price,
+                    'position_size': position,
+                    'profit_loss': trade_profit,
+                    'profit_loss_pct': trade_result,
+                    'exit_reason': 'end_of_data'
+                })
+            else:  # Short-Position
+                trade_result = (entry_price / last_price - 1) * 100
+                trade_profit = -position * entry_price * (entry_price / last_price - 1)
+                capital += -position * entry_price * (1 - commission) - (-position) * last_price * (1 + commission)
+                
+                trades.append({
+                    'entry_time': entry_time,
+                    'exit_time': results.index[-1],
+                    'direction': 'short',
+                    'entry_price': entry_price,
+                    'exit_price': last_price,
+                    'position_size': -position,
+                    'profit_loss': trade_profit,
+                    'profit_loss_pct': trade_result,
+                    'exit_reason': 'end_of_data'
+                })
+            
+            # Letzte Equity und Kapital aktualisieren
+            results.loc[results.index[-1], 'equity'] = capital
+            results.loc[results.index[-1], 'capital'] = capital
+        
+        # Handels-DataFrame erstellen
+        trades_df = pd.DataFrame(trades)
+        
+        # Metriken berechnen
+        metrics = self._calculate_performance_metrics(results, trades_df, initial_capital)
+        
+        return results, metrics
+    
+    def _calculate_performance_metrics(
+        self,
+        results: pd.DataFrame,
+        trades_df: pd.DataFrame,
+        initial_capital: float
+    ) -> Dict[str, Any]:
+        """
+        Berechnet Performance-Metriken für den Backtest.
+        
+        Args:
+            results: DataFrame mit Backtest-Ergebnissen
+            trades_df: DataFrame mit Trades
+            initial_capital: Anfangskapital
+            
+        Returns:
+            Dict[str, Any]: Performance-Metriken
+        """
+        if results.empty:
+            return {}
+        
+        # Finale Equity
+        final_equity = results.iloc[-1]['equity']
+        
+        # Gesamtgewinn/-verlust
+        total_profit_loss = final_equity - initial_capital
+        total_profit_loss_pct = (total_profit_loss / initial_capital) * 100
+        
+        # Maximaler Drawdown
+        max_drawdown = results['drawdown'].max()
+        max_drawdown_pct = results['drawdown_pct'].max()
+        
+        # Anzahl der Trades
+        num_trades = len(trades_df)
+        
+        # Gewinnende und verlierende Trades
+        winning_trades = trades_df[trades_df['profit_loss'] > 0]
+        losing_trades = trades_df[trades_df['profit_loss'] <= 0]
+        
+        num_winning_trades = len(winning_trades)
+        num_losing_trades = len(losing_trades)
+        
+        # Win-Rate
+        win_rate = (num_winning_trades / num_trades) * 100 if num_trades > 0 else 0
+        
+        # Durchschnittlicher Gewinn und Verlust
+        avg_winning_trade = winning_trades['profit_loss'].mean() if len(winning_trades) > 0 else 0
+        avg_losing_trade = losing_trades['profit_loss'].mean() if len(losing_trades) > 0 else 0
+        
+        # Profit-Faktor
+        total_winning = winning_trades['profit_loss'].sum() if len(winning_trades) > 0 else 0
+        total_losing = abs(losing_trades['profit_loss'].sum()) if len(losing_trades) > 0 else 0
+        profit_factor = total_winning / total_losing if total_losing > 0 else float('inf')
+        
+        # Sharpe-Ratio (vereinfacht)
+        if 'returns' in results.columns and len(results) > 1:
+            daily_returns = results['equity'].pct_change().dropna()
+            sharpe_ratio = (daily_returns.mean() / daily_returns.std()) * np.sqrt(252) if daily_returns.std() > 0 else 0
+        else:
+            sharpe_ratio = 0
+        
+        # Recovery-Faktor
+        recovery_factor = total_profit_loss / max_drawdown if max_drawdown > 0 else float('inf')
+        
+        # Metriken zusammenstellen
+        metrics = {
+            'initial_capital': initial_capital,
+            'final_equity': final_equity,
+            'total_profit_loss': total_profit_loss,
+            'total_profit_loss_pct': total_profit_loss_pct,
+            'max_drawdown': max_drawdown,
+            'max_drawdown_pct': max_drawdown_pct,
+            'num_trades': num_trades,
+            'num_winning_trades': num_winning_trades,
+            'num_losing_trades': num_losing_trades,
+            'win_rate': win_rate,
+            'avg_winning_trade': avg_winning_trade,
+            'avg_losing_trade': avg_losing_trade,
+            'profit_factor': profit_factor,
+            'sharpe_ratio': sharpe_ratio,
+            'recovery_factor': recovery_factor,
+            'trades': trades_df.to_dict('records')
+        }
+        
+        return metrics
+
+
+class BollingerBandsStrategy(StrategyBase):
+    """
+    Implementierung einer Handelsstrategie basierend auf Bollinger-Bändern.
+    """
+    
+    def __init__(
+        self,
+        name: str = "Bollinger Bands Strategy",
+        description: str = "Handelt auf Basis von Bollinger-Band-Breakouts",
+        parameters: Dict[str, Any] = None,
+        risk_per_trade: float = 1.0
+    ):
+        """
+        Initialisiert die Bollinger-Bands-Strategie.
+        
+        Args:
+            name: Name der Strategie
+            description: Beschreibung der Strategie
+            parameters: Parameter der Strategie (window, std_dev, etc.)
+            risk_per_trade: Risiko pro Trade in Prozent des Kapitals
+        """
+        default_params = {
+            'window': 20,
+            'std_dev': 2.0,
+            'rsi_period': 14,
+            'rsi_overbought': 70,
+            'rsi_oversold': 30,
+            'volume_filter': True
+        }
+        
+        if parameters:
+            default_params.update(parameters)
+        
+        super().__init__(name, description, default_params, risk_per_trade)
+    
+    def generate_signals(self) -> pd.DataFrame:
+        """
+        Generiert Handelssignale basierend auf Bollinger-Bändern.
+        
+        Returns:
+            pd.DataFrame: DataFrame mit Signalen (1 für Long, -1 für Short, 0 für neutral)
+        """
+        if not self.is_initialized or self._data is None or self._data.empty:
+            logger.error("Strategie nicht initialisiert oder keine Daten vorhanden")
+            return pd.DataFrame()
+        
+        # Daten kopieren
+        data = self._data.copy()
+        
+        # Parameter extrahieren
+        window = self.parameters['window']
+        std_dev = self.parameters['std_dev']
+        rsi_period = self.parameters['rsi_period']
+        rsi_overbought = self.parameters['rsi_overbought']
+        rsi_oversold = self.parameters['rsi_oversold']
+        volume_filter = self.parameters['volume_filter']
+        
+        # Bollinger-Bänder berechnen, falls nicht vorhanden
+        if 'sma_20' not in data.columns:
+            data['sma_20'] = data['close'].rolling(window=window).mean()
+        
+        if 'bollinger_upper' not in data.columns or 'bollinger_lower' not in data.columns:
+            data['bollinger_std'] = data['close'].rolling(window=window).std()
+            data['bollinger_upper'] = data['sma_20'] + std_dev * data['bollinger_std']
+            data['bollinger_lower'] = data['sma_20'] - std_dev * data['bollinger_std']
+        
+        # RSI berechnen, falls nicht vorhanden
+        if 'rsi' not in data.columns:
+            delta = data['close'].diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=rsi_period).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=rsi_period).mean()
+            rs = gain / loss
+            data['rsi'] = 100 - (100 / (1 + rs))
+        
+        # Signal-Spalte erstellen
+        data['signal'] = 0
+        
+        # Volumen-Filter
+        if volume_filter and 'volume' in data.columns and 'volume_sma_20' in data.columns:
+            volume_filter_condition = data['volume'] > data['volume_sma_20']
+        else:
+            volume_filter_condition = pd.Series(True, index=data.index)
+        
+        # Long-Signale: Preis kreuzt unteres Band nach oben und RSI < oversold
+        long_condition = (
+            (data['close'] > data['bollinger_lower']) & 
+            (data['close'].shift(1) <= data['bollinger_lower'].shift(1)) &
+            (data['rsi'] < rsi_oversold) &
+            volume_filter_condition
+        )
+        
+        # Short-Signale: Preis kreuzt oberes Band nach unten und RSI > overbought
+        short_condition = (
+            (data['close'] < data['bollinger_upper']) & 
+            (data['close'].shift(1) >= data['bollinger_upper'].shift(1)) &
+            (data['rsi'] > rsi_overbought) &
+            volume_filter_condition
+        )
+        
+        # Signale setzen
+        data.loc[long_condition, 'signal'] = 1
+        data.loc[short_condition, 'signal'] = -1
+        
+        # NaNs entfernen (am Anfang wegen Rolling Windows)
+        data = data.dropna()
+        
+        return data
+
+
+class MovingAverageCrossStrategy(StrategyBase):
+    """
+    Implementierung einer Handelsstrategie basierend auf dem Kreuzen von gleitenden Durchschnitten.
+    """
+    
+    def __init__(
+        self,
+        name: str = "Moving Average Cross Strategy",
+        description: str = "Handelt auf Basis von Kreuzungen gleitender Durchschnitte",
+        parameters: Dict[str, Any] = None,
+        risk_per_trade: float = 1.0
+    ):
+        """
+        Initialisiert die Moving-Average-Cross-Strategie.
+        
+        Args:
+            name: Name der Strategie
+            description: Beschreibung der Strategie
+            parameters: Parameter der Strategie (fast_ma, slow_ma, etc.)
+            risk_per_trade: Risiko pro Trade in Prozent des Kapitals
+        """
+        default_params = {
+            'fast_ma': 10,
+            'slow_ma': 50,
+            'signal_ma': 9,
+            'use_ema': True,
+            'volume_filter': True
+        }
+        
+        if parameters:
+            default_params.update(parameters)
+        
+        super().__init__(name, description, default_params, risk_per_trade)
+    
+def generate_signals(self) -> pd.DataFrame:
+        """
+        Generiert Handelssignale basierend auf dem Kreuzen von gleitenden Durchschnitten.
+        
+        Returns:
+            pd.DataFrame: DataFrame mit Signalen (1 für Long, -1 für Short, 0 für neutral)
+        """
+        if not self.is_initialized or self._data is None or self._data.empty:
+            logger.error("Strategie nicht initialisiert oder keine Daten vorhanden")
+            return pd.DataFrame()
+        
+        # Daten kopieren
+        data = self._data.copy()
+        
+        # Parameter extrahieren
+        fast_ma = self.parameters['fast_ma']
+        slow_ma = self.parameters['slow_ma']
+        signal_ma = self.parameters['signal_ma']
+        use_ema = self.parameters['use_ema']
+        volume_filter = self.parameters['volume_filter']
+        
+        # Gleitende Durchschnitte berechnen, falls nicht vorhanden
+        if use_ema:
+            if f'ema_{fast_ma}' not in data.columns:
+                data[f'ema_{fast_ma}'] = data['close'].ewm(span=fast_ma, adjust=False).mean()
+            if f'ema_{slow_ma}' not in data.columns:
+                data[f'ema_{slow_ma}'] = data['close'].ewm(span=slow_ma, adjust=False).mean()
+            
+            # MACD berechnen
+            data['macd'] = data[f'ema_{fast_ma}'] - data[f'ema_{slow_ma}']
+            data['macd_signal'] = data['macd'].ewm(span=signal_ma, adjust=False).mean()
+            data['macd_histogram'] = data['macd'] - data['macd_signal']
+        else:
+            if f'sma_{fast_ma}' not in data.columns:
+                data[f'sma_{fast_ma}'] = data['close'].rolling(window=fast_ma).mean()
+            if f'sma_{slow_ma}' not in data.columns:
+                data[f'sma_{slow_ma}'] = data['close'].rolling(window=slow_ma).mean()
+            
+            # MACD berechnen (mit SMA statt EMA)
+            data['macd'] = data[f'sma_{fast_ma}'] - data[f'sma_{slow_ma}']
+            data['macd_signal'] = data['macd'].rolling(window=signal_ma).mean()
+            data['macd_histogram'] = data['macd'] - data['macd_signal']
+        
+        # Signal-Spalte erstellen
+        data['signal'] = 0
+        
+        # Volumen-Filter
+        if volume_filter and 'volume' in data.columns and 'volume_sma_20' in data.columns:
+            volume_filter_condition = data['volume'] > data['volume_sma_20']
+        else:
+            volume_filter_condition = pd.Series(True, index=data.index)
+        
+        # Long-Signal: MACD kreuzt Signal-Linie von unten nach oben
+        long_condition = (
+            (data['macd'] > data['macd_signal']) & 
+            (data['macd'].shift(1) <= data['macd_signal'].shift(1)) &
+            volume_filter_condition
+        )
+        
+        # Short-Signal: MACD kreuzt Signal-Linie von oben nach unten
+        short_condition = (
+            (data['macd'] < data['macd_signal']) & 
+            (data['macd'].shift(1) >= data['macd_signal'].shift(1)) &
+            volume_filter_condition
+        )
+        
+        # Signale setzen
+        data.loc[long_condition, 'signal'] = 1
+        data.loc[short_condition, 'signal'] = -1
+        
+        # NaNs entfernen (am Anfang wegen Rolling Windows)
+        data = data.dropna()
+        
+        return data

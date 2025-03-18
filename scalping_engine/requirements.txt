@@ -1,0 +1,32 @@
+# Web-Framework
+fastapi==0.95.0
+uvicorn==0.21.1
+pydantic==1.10.7
+
+# Datenbank
+sqlalchemy==2.0.9
+psycopg2-binary==2.9.6
+alembic==1.10.3
+asyncpg==0.27.0
+
+# Datenverarbeitung
+pandas==2.0.0
+numpy==1.24.2
+
+# Marktdaten
+ccxt==3.0.72
+yfinance==0.2.18
+
+# Visualisierung
+matplotlib==3.7.1
+seaborn==0.12.2
+
+# Utilities
+python-dotenv==1.0.0
+loguru==0.7.0
+tqdm==4.66.1
+jinja2==3.1.2
+
+# Testing
+pytest==7.3.1
+pytest-asyncio==0.21.0
