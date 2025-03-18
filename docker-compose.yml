@@ -1,0 +1,51 @@
+version: '3.8'
+
+services:
+  # TimescaleDB für Zeitreihendaten
+  timescaledb:
+    image: timescale/timescaledb:latest-pg14
+    container_name: scalping_timescaledb
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=${DB_USER:-scalpuser}
+      - POSTGRES_PASSWORD=${DB_PASSWORD:-scalppass}
+      - POSTGRES_DB=${DB_NAME:-scalpingdb}
+    volumes:
+      - timescaledb_data:/var/lib/postgresql/data
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-scalpuser} -d ${DB_NAME:-scalpingdb}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Python-basierte Scalping-Engine
+  scalping_engine:
+    build:
+      context: ./scalping_engine
+      dockerfile: Dockerfile
+    container_name: scalping_engine
+    restart: unless-stopped
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    environment:
+      - DB_HOST=timescaledb
+      - DB_PORT=5432
+      - DB_USER=${DB_USER:-scalpuser}
+      - DB_PASSWORD=${DB_PASSWORD:-scalppass}
+      - DB_NAME=${DB_NAME:-scalpingdb}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - DEBUG=${DEBUG:-false}
+    volumes:
+      - ./scalping_engine:/app
+      - ./logs:/app/logs
+      - ./data:/app/data
+    ports:
+      - "${API_PORT:-8001}:8000"
+    command: ["uvicorn", "scalping_engine.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+
+volumes:
+  timescaledb_data:
+    driver: local

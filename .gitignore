@@ -1,0 +1,8 @@
+.env
+# Ignore all __pycache__ directories and their contents
+**/__pycache__/
+**/*.py[cod]
+*$py.class
+
+# Ignore compiled Python files
+*.pyc
