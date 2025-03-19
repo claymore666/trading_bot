@@ -17,6 +17,7 @@ from loguru import logger
 from scalping_engine.data_manager.fetcher import fetch_market_data
 from scalping_engine.data_manager.processor import process_market_data
 from scalping_engine.data_manager.storage import DataStorage
+from scalping_engine.data_manager.market_analyzer import analyze_market_and_recommend_strategies
 from scalping_engine.backtesting.engine import BacktestingEngine, BacktestConfig
 from scalping_engine.strategy_engine.strategy_base import StrategyBase, load_strategies
 from scalping_engine.utils.db import get_async_db
@@ -97,175 +98,19 @@ async def main():
     # Asset analysieren
     print(f"\nAnalysiere {symbol}...")
     
-    # Primären Zeitrahmen für die Analyse bestimmen (bevorzugt 1h)
-    primary_tf = "1h" if "1h" in data else list(data.keys())[0]
-    primary_data = data[primary_tf]
+    # Vollständige Marktanalyse mit dem neuen Modul durchführen
+    market_analysis = analyze_market_and_recommend_strategies(symbol, data)
     
-    # Einfache Marktanalyse
-    market_type = "unknown"
-    volatility = "unknown"
-    trend_strength = "unknown"
-    
-    # Volatilität analysieren
-    if 'atr' in primary_data.columns and 'close' in primary_data.columns:
-        atr_pct = (primary_data['atr'] / primary_data['close'] * 100).mean()
-        
-        if atr_pct < 1.0:
-            volatility = "low"
-        elif atr_pct < 3.0:
-            volatility = "medium"
-        else:
-            volatility = "high"
-    
-    # Trendstärke analysieren
-    if 'close' in primary_data.columns:
-        price_changes = primary_data['close'].pct_change(14)
-        if price_changes.std() > 0:
-            trend_strength_value = abs(price_changes.mean()) / price_changes.std()
-            
-            if trend_strength_value < 0.1:
-                trend_strength = "weak"
-            elif trend_strength_value < 0.3:
-                trend_strength = "moderate"
-            else:
-                trend_strength = "strong"
-    
-    # Mean Reversion Eigenschaften analysieren
-    mean_reversion = "unknown"
-    if 'close' in primary_data.columns and len(primary_data) >= 20:
-        returns = primary_data['close'].pct_change().dropna()
-        lagged_returns = returns.shift(1).dropna()
-        
-        common_idx = returns.index.intersection(lagged_returns.index)
-        if len(common_idx) > 0:
-            correlation = returns.loc[common_idx].corr(lagged_returns.loc[common_idx])
-            
-            if correlation < -0.2:
-                mean_reversion = "strong"
-            elif correlation < 0:
-                mean_reversion = "moderate"
-            else:
-                mean_reversion = "weak"
-    
-    # Markttyp bestimmen
-    if trend_strength == "strong":
-        market_type = "trending"
-    elif mean_reversion in ["strong", "moderate"]:
-        market_type = "mean_reverting"
-    elif volatility == "high":
-        market_type = "volatile"
-    else:
-        market_type = "mixed"
-    
+    # Analyseergebnisse ausgeben
     print(f"\n=== Asset-Analyse ===")
     print(f"Symbol: {symbol}")
-    print(f"Markttyp: {market_type}")
-    print(f"Volatilität: {volatility}")
-    print(f"Trendstärke: {trend_strength}")
-    print(f"Mean Reversion: {mean_reversion}")
+    print(f"Markttyp: {market_analysis['summary']['market_type']}")
+    print(f"Volatilität: {market_analysis['summary']['volatility']}")
+    print(f"Trendstärke: {market_analysis['summary']['trend_strength']}")
+    print(f"Mean Reversion: {market_analysis['summary']['mean_reversion']}")
     
-    # Strategien empfehlen
-    recommended_strategies = []
-    
-    # Strategien für Trending Markets
-    if market_type == "trending":
-        recommended_strategies.append({
-            "strategy": "MovingAverageCrossStrategy",
-            "reason": "Eignet sich gut für trendstarke Märkte mit klaren Richtungsbewegungen.",
-            "suggested_params": {
-                "fast_ma": 10,
-                "slow_ma": 30,
-                "signal_ma": 9,
-                "use_ema": True
-            }
-        })
-        
-        recommended_strategies.append({
-            "strategy": "ParabolicSARStrategy",
-            "reason": "Effektiv für die Verfolgung von Trends mit automatischer Anpassung an die Marktdynamik.",
-            "suggested_params": {
-                "initial_af": 0.02,
-                "max_af": 0.2,
-                "trend_filter": True
-            }
-        })
-    
-    # Strategien für Mean Reverting Markets
-    elif market_type == "mean_reverting":
-        recommended_strategies.append({
-            "strategy": "BollingerBandsStrategy",
-            "reason": "Optimal für Märkte mit Mean-Reversion-Eigenschaften und klaren Unterstützungs-/Widerstandsbereichen.",
-            "suggested_params": {
-                "window": 20,
-                "std_dev": 2.0,
-                "rsi_period": 14,
-                "rsi_overbought": 70,
-                "rsi_oversold": 30
-            }
-        })
-        
-        recommended_strategies.append({
-            "strategy": "MeanReversionStrategy",
-            "reason": "Speziell für Mean-Reversion-Dynamik entwickelt mit statistischen Abweichungen vom Mittelwert.",
-            "suggested_params": {
-                "lookback_period": 20,
-                "z_score_threshold": 2.0,
-                "rsi_filter": True
-            }
-        })
-    
-    # Strategien für Volatile Markets
-    elif market_type == "volatile":
-        recommended_strategies.append({
-            "strategy": "BreakoutStrategy",
-            "reason": "Nutzt Ausbrüche aus Konsolidierungsphasen in volatilen Märkten.",
-            "suggested_params": {
-                "bb_squeeze_factor": 0.7,
-                "breakout_threshold_pct": 0.5,
-                "volume_filter_on": True
-            }
-        })
-        
-        recommended_strategies.append({
-            "strategy": "BollingerBandsStrategy",
-            "reason": "Kann in volatilen Märkten effektiv sein durch Identifikation von Extremwerten.",
-            "suggested_params": {
-                "window": 20,
-                "std_dev": 2.5,  # Höhere Standardabweichung für volatile Märkte
-                "rsi_period": 14,
-                "rsi_overbought": 75,  # Angepasste RSI-Niveaus für Volatilität
-                "rsi_oversold": 25
-            }
-        })
-    
-    # Allgemeine Strategien für gemischte Märkte
-    else:
-        recommended_strategies.append({
-            "strategy": "BollingerBandsStrategy",
-            "reason": "Vielseitige Strategie, die in verschiedenen Marktbedingungen funktionieren kann.",
-            "suggested_params": {
-                "window": 20,
-                "std_dev": 2.0,
-                "rsi_period": 14,
-                "rsi_overbought": 70,
-                "rsi_oversold": 30
-            }
-        })
-        
-        recommended_strategies.append({
-            "strategy": "MovingAverageCrossStrategy",
-            "reason": "Klassische Strategie, die in verschiedenen Marktbedingungen funktionieren kann.",
-            "suggested_params": {
-                "fast_ma": 10,
-                "slow_ma": 30,
-                "signal_ma": 9,
-                "use_ema": True
-            }
-        })
-    
-    # Empfehlungen filtern (nur verfügbare Strategien)
-    available_strategy_names = [s["name"] for s in strategy_list]
-    recommended_strategies = [r for r in recommended_strategies if r["strategy"] in available_strategy_names]
+    # Strategieempfehlungen
+    recommended_strategies = market_analysis['recommended_strategies']
     
     print("\n=== Empfohlene Strategien ===")
     for i, strategy in enumerate(recommended_strategies):
@@ -299,9 +144,9 @@ async def main():
     print(f"\nAusgewählte Strategie: {strategy_type}")
     
     # Primären Zeitrahmen für die Strategie bestimmen
-    if strategy_type == "BollingerBandsStrategy" or strategy_type == "MeanReversionStrategy":
+    if strategy_type in ["BollingerBandsStrategy", "MeanReversionStrategy"]:
         preferred_tf = ["15m", "5m", "1h"]
-    elif strategy_type == "MovingAverageCrossStrategy" or strategy_type == "ParabolicSARStrategy":
+    elif strategy_type in ["MovingAverageCrossStrategy", "ParabolicSARStrategy"]:
         preferred_tf = ["1h", "4h", "15m"]
     elif strategy_type == "BreakoutStrategy":
         preferred_tf = ["5m", "15m", "1h"]
